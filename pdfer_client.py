@@ -19,6 +19,12 @@ Exemplos:
   # 100 POST de 1000 caracteres, 1 de cada vez
   python3 pdfer_client.py --mode post --length 1000 --requests 100
 
+  # 10 GET a um ficheiro que já existe no servidor (nome = id do ficheiro)
+  python3 pdfer_client.py --mode get --file teste1.txt --requests 10
+
+  # 100 GET aos ficheiros que já existem no servidor, sem criar nenhum
+  python3 pdfer_client.py --mode get --existing --requests 100
+
   # 200 GET a 20 ficheiros criados antes, 4 pedidos em simultâneo
   python3 pdfer_client.py --mode get --length 1000 --prepare 20 --requests 200 --concurrency 4
 
@@ -249,7 +255,8 @@ class LoadRun:
         self.rows = []
         self.lock = threading.Lock()
         self.seq = 0
-        self.created = []          # ficheiros disponíveis para GET
+        self.created = list(args.file or [])   # ficheiros disponíveis para GET
+        self.fixed_pool = bool(args.file) or args.existing  # só se leem esses
         self.stop_at = None
         self.rng = random.Random(args.seed)
         self.prom = None
@@ -300,7 +307,9 @@ class LoadRun:
         row = {
             "run_id": self.run_id, "seq": seq, "worker": worker,
             "phase": "warmup" if seq <= self.a.warmup else "measure",
-            "method": method, "length": "" if method == "LIST" else self.a.length,
+            # nas listagens não há tamanho; nos GET com --file o tamanho real não é conhecido
+            "method": method,
+            "length": "" if method == "LIST" or (method == "GET" and self.fixed_pool) else self.a.length,
             "file_name": file_name, "files_listed": files_listed(data) if method == "LIST" else "",
             "start_epoch": f"{start:.6f}", "client_ms": f"{ms:.3f}" if ms is not None else "",
             "http_status": status if status is not None else "", "ok": int(ok),
@@ -311,7 +320,7 @@ class LoadRun:
             row[f"srv_{f}_us"] = "" if v is None else v
         with self.lock:
             self.rows.append(row)
-            if ok and method == "POST":
+            if ok and method == "POST" and not self.fixed_pool:
                 self.created.append(file_name)
         if self.prom is not None:
             self.prom.inc("pdfer_client_requests_total",
@@ -362,8 +371,29 @@ class LoadRun:
         finally:
             conn.close()
 
+    def load_existing(self):
+        """--existing: usa os ficheiros que já estão no servidor (GET /files)."""
+        conn = PdferConnection(self.a.host, self.a.port, self.a.timeout)
+        try:
+            status, data, _ = do_list(conn)
+        finally:
+            conn.close()
+        if status != 200:
+            sys.exit(f"Erro a listar os ficheiros: HTTP {status} {data[:200]!r}")
+        names = json.loads(data).get("files") or []
+        if self.a.existing_prefix:
+            names = [n for n in names if n.startswith(self.a.existing_prefix)]
+        if not names:
+            sys.exit("O servidor não tem ficheiros para ler"
+                     + (f" com o prefixo '{self.a.existing_prefix}'" if self.a.existing_prefix else "")
+                     + ". Crie alguns primeiro (modo post) ou use --file.")
+        self.created.extend(names)
+        print(f"A ler {len(names)} ficheiro(s) que já existem no servidor.", flush=True)
+
     def prepare(self):
         """Cria ficheiros antes da medição (necessário para os GET)."""
+        if self.a.existing:
+            self.load_existing()
         n = self.a.prepare
         if n <= 0:
             return
@@ -419,8 +449,12 @@ class LoadRun:
         if not meas:
             print("Sem pedidos medidos.")
             return
+        # Janela de medição: do início do primeiro pedido ao fim do último
+        # (início + duração). Assim o débito também é correto com 1 só pedido.
         starts = [float(r["start_epoch"]) for r in meas]
-        span = max(max(starts) - min(starts), 1e-9)
+        ends = [float(r["start_epoch"]) + float(r["client_ms"]) / 1000.0
+                for r in meas if r["client_ms"] not in ("", None)]
+        span = max((max(ends) if ends else max(starts)) - min(starts), 1e-6)
         print()
         print(f"Resumo (sem os {self.a.warmup} pedido(s) de aquecimento):")
         for method in ("POST", "GET", "LIST"):
@@ -482,6 +516,14 @@ def main():
     p.add_argument("--list-ratio", type=float, default=0.0,
                    help="fração de listagens (GET /files) no modo mixed; o resto são GET de "
                         "ficheiros (default: %(default)s)")
+    p.add_argument("--file", action="append", metavar="NOME",
+                   help="nos GET, ler este ficheiro já existente (o id/nome usado no POST); "
+                        "repetir a opção para vários ficheiros; dispensa o --prepare")
+    p.add_argument("--existing", action="store_true",
+                   help="nos GET, ler os ficheiros que já existem no servidor (pede a lista com "
+                        "GET /files) em vez de criar ficheiros novos")
+    p.add_argument("--existing-prefix", metavar="PREFIXO",
+                   help="com --existing, usar só os ficheiros cujo nome começa por PREFIXO")
     p.add_argument("--key", default="chave-de-teste16", help="chave de 16, 24 ou 32 caracteres")
     p.add_argument("--prefix", default="cli", help="prefixo dos nomes de ficheiro")
     p.add_argument("--timeout", type=float, default=120.0, help="timeout por pedido em segundos")
@@ -500,8 +542,12 @@ def main():
         p.error("--concurrency, --requests e --length têm de ser >= 1")
     if not (0.0 <= a.post_ratio <= 1.0 and 0.0 <= a.list_ratio <= 1.0) or a.post_ratio + a.list_ratio > 1.0:
         p.error("--post-ratio e --list-ratio têm de estar entre 0 e 1 e somar no máximo 1")
+    if (a.file or a.existing) and a.mode not in ("get", "mixed"):
+        p.error("--file e --existing só se aplicam aos modos get e mixed")
+    if a.existing_prefix and not a.existing:
+        p.error("--existing-prefix só se usa com --existing")
     if a.prepare is None:
-        a.prepare = 0 if a.mode in ("post", "list") else 20
+        a.prepare = 0 if (a.mode in ("post", "list") or a.file or a.existing) else 20
 
     run = LoadRun(a)
     try:
