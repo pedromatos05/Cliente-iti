@@ -1,38 +1,38 @@
 #!/usr/bin/env python3
 """
-pdfer_client.py - Cliente de carga para o servidor PDFer (ITI 2025/2026).
+pdfer_client.py - Cliente para o servidor PDFer (ITI 2025/2026).
 
-Faz pedidos ao PDFer e mede o tempo de cada um do lado do cliente:
-  POST /files            -> "POST": gera, cifra e guarda um ficheiro
-  GET  /files/{fileId}   -> "GET":  lê e decifra um ficheiro
-  GET  /files            -> "LIST": lista os ficheiros guardados
-Guarda também guarda as métricas devolvidas pelo servidor
-e escreve tudo num CSV (uma linha por pedido). No fim mostra um resumo
-separado para POST e GET.
+O servidor PDFer tem três métodos:
+  GET  /files            lista os ficheiros da pasta "store"           (sem parâmetros)
+  POST /files            cria e cifra um ficheiro          (body: key, length, fileName)
+  GET  /files/{fileId}   decifra e devolve um ficheiro                       (body: key)
 
-Opcionalmente (--metrics-port), publica as métricas no formato do Prometheus
-em http://<node2>:<porta>/metrics, para as ver ao vivo no Grafana.
+O cliente tem duas partes:
 
+1) PEDIDOS NORMAIS (como o curl) - mostram a resposta do servidor
+     list                      lista os nomes dos ficheiros
+     get  <fileId>             mostra o conteúdo decifrado de um ficheiro
+     post <fileName> -l N      cria um ficheiro com N caracteres
+     post -c 50 -t 4 -l N      cria 50 ficheiros, 4 em simultâneo (threads)
+
+2) TESTES DE PRESSÃO - muitos pedidos com threads; mostram métricas
+     stress --mode post|get|list|mixed
+   Resumo no ecrã (débito, média, p50, p95, p99), CSV com uma linha por pedido
+   e, com --metrics-port, métricas para o Prometheus/Grafana.
+   Os GET nunca criam ficheiros: leem ficheiros que já existem no servidor.
+
+A chave (key) tem de ter exatamente 16 bytes; por omissão é "chave-de-teste16".
 Usa apenas a biblioteca padrão do Python 3 (não é preciso instalar nada).
 
 Exemplos:
-  # 100 POST de 1000 caracteres, 1 de cada vez
-  python3 pdfer_client.py --mode post --length 1000 --requests 100
-
-  # 10 GET a um ficheiro que já existe no servidor (nome = id do ficheiro)
-  python3 pdfer_client.py --mode get --file teste1.txt --requests 10
-
-  # 100 GET aos ficheiros que já existem no servidor, sem criar nenhum
-  python3 pdfer_client.py --mode get --existing --requests 100
-
-  # 200 GET a 20 ficheiros criados antes, 4 pedidos em simultâneo
-  python3 pdfer_client.py --mode get --length 1000 --prepare 20 --requests 200 --concurrency 4
-
-  # 100 listagens com 1000 ficheiros na pasta (efeito do n.º de ficheiros)
-  python3 pdfer_client.py --mode list --prepare 1000 --length 100 --requests 100
-
-  # carga mista: 30% POST, 10% LIST, 60% GET durante 60 segundos
-  python3 pdfer_client.py --mode mixed --post-ratio 0.3 --list-ratio 0.1 --duration 60 --concurrency 8
+  python3 pdfer_client.py list
+  python3 pdfer_client.py post teste1.txt --length 1000
+  python3 pdfer_client.py get teste1.txt
+  python3 pdfer_client.py post --count 20 --threads 4 --length 10000 --prefix e1-
+  python3 pdfer_client.py stress --mode get --prefix e1- --threads 4 --requests 200
+  python3 pdfer_client.py stress --mode post --length 1000 --threads 2 --duration 60
+  python3 pdfer_client.py stress --mode mixed --post-ratio 0.3 --list-ratio 0.1 \\
+          --threads 4 --duration 120 --metrics-port 9200
 """
 
 import argparse
@@ -46,8 +46,14 @@ import statistics
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+DEFAULT_HOST = "192.168.57.11"
+DEFAULT_PORT = 8080
+DEFAULT_KEY = "chave-de-teste16"
+KEY_BYTES = 16          # o PDFer só aceita chaves de 16 bytes
 
 SERVER_FIELDS = [
     "total",
@@ -59,15 +65,236 @@ SERVER_FIELDS = [
     "decryption",
 ]
 
+FIELD_LABELS = {          # nomes curtos para mostrar no ecrã
+    "total": "total",
+    "readFileSystemEntries": "ler a pasta",
+    "generateFile": "gerar",
+    "encryption": "cifrar",
+    "writeFile": "escrever",
+    "readFile": "ler",
+    "decryption": "decifrar",
+}
+
 CSV_COLUMNS = [
     "run_id", "seq", "worker", "phase", "method", "length", "file_name", "files_listed",
     "start_epoch", "client_ms", "http_status", "ok", "error", "response_bytes",
 ] + [f"srv_{f}_us" for f in SERVER_FIELDS]
 
 
-# --------------------------------------------------------------------------
+# ==========================================================================
+# Comunicação com o servidor
+# ==========================================================================
+class PdferConnection:
+    """Uma ligação HTTP persistente (keep-alive). Usar uma por thread."""
+
+    def __init__(self, host, port, timeout):
+        self.host, self.port, self.timeout = host, port, timeout
+        self.conn = None
+
+    def _connect(self):
+        self.conn = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
+        self.conn.connect()
+        # Desliga o algoritmo de Nagle: evita atrasos artificiais (~40 ms)
+        # em pedidos pequenos, que falseariam os tempos medidos.
+        self.conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    def request(self, method, path, payload):
+        """Envia o pedido e devolve (status, corpo da resposta, tempo em ms)."""
+        body = json.dumps(payload).encode() if payload is not None else None
+        headers = {"Content-Type": "application/json"} if body else {}
+        for attempt in (1, 2):  # 2.ª tentativa só se a ligação keep-alive tiver caído
+            if self.conn is None:
+                self._connect()
+            try:
+                t0 = time.perf_counter()
+                self.conn.request(method, path, body=body, headers=headers)
+                resp = self.conn.getresponse()
+                data = resp.read()
+                elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                return resp.status, data, elapsed_ms
+            except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError):
+                self.close()
+                if attempt == 2:
+                    raise
+
+    def close(self):
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            finally:
+                self.conn = None
+
+
+# Os três métodos do PDFer, com os parâmetros que cada um exige
+def do_list(conn):
+    """GET /files - sem parâmetros."""
+    return conn.request("GET", "/files", None)
+
+
+def do_post(conn, key, length, file_name):
+    """POST /files - body: key, length, fileName."""
+    return conn.request("POST", "/files", {"key": key, "length": length, "fileName": file_name})
+
+
+def do_get(conn, key, file_id):
+    """GET /files/{fileId} - body: key."""
+    return conn.request("GET", f"/files/{file_id}", {"key": key})
+
+
+def parse_json(data):
+    try:
+        return json.loads(data)
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_server_metrics(data):
+    obj = parse_json(data)
+    m = (obj or {}).get("metrics") if isinstance(obj, dict) else None
+    m = m or {}
+    return {f: m.get(f) for f in SERVER_FIELDS}
+
+
+def files_from_listing(data):
+    obj = parse_json(data)
+    if not isinstance(obj, dict):
+        return None
+    return obj.get("files") or []
+
+
+def error_text(status, data):
+    """Mensagem de erro curta a partir da resposta do servidor."""
+    txt = data[:200].decode(errors="replace").strip() if data else ""
+    return f"HTTP {status}: {txt}" if txt else f"HTTP {status}"
+
+
+def format_server_metrics(srv, only_nonzero=True):
+    parts = []
+    for f in SERVER_FIELDS:
+        v = srv.get(f)
+        if isinstance(v, (int, float)) and (v > 0 or not only_nonzero):
+            parts.append(f"{FIELD_LABELS[f]} {v / 1000:.3f} ms")
+    return " | ".join(parts) if parts else "sem métricas"
+
+
+def check_key(parser, key):
+    n = len(key.encode())
+    if n != KEY_BYTES:
+        parser.error(f"a chave tem {n} bytes; o PDFer só aceita chaves de {KEY_BYTES} bytes "
+                     "(responde 'HTTP 400: Key must be 16 bytes length')")
+
+
+# ==========================================================================
+# Parte 1 - pedidos normais (mostram a resposta)
+# ==========================================================================
+def cmd_list(a):
+    conn = PdferConnection(a.host, a.port, a.timeout)
+    try:
+        status, data, ms = do_list(conn)
+    finally:
+        conn.close()
+    if a.json:
+        print(data.decode(errors="replace"))
+        return 0 if status == 200 else 1
+    print(f"GET /files  ->  HTTP {status}  ({ms:.2f} ms no cliente)")
+    if status != 200:
+        print(f"Erro: {error_text(status, data)}")
+        return 1
+    names = files_from_listing(data) or []
+    print(f"\n{len(names)} ficheiro(s) na pasta store:")
+    for i, n in enumerate(names, 1):
+        print(f"  {i:4d}  {n}")
+    print(f"\nServidor: {format_server_metrics(parse_server_metrics(data))}")
+    return 0
+
+
+def cmd_get(a):
+    conn = PdferConnection(a.host, a.port, a.timeout)
+    try:
+        status, data, ms = do_get(conn, a.key, a.file_id)
+    finally:
+        conn.close()
+    if a.json:
+        print(data.decode(errors="replace"))
+        return 0 if status == 200 else 1
+    print(f"GET /files/{a.file_id}  (key={a.key})  ->  HTTP {status}  ({ms:.2f} ms no cliente)")
+    if status != 200:
+        print(f"Erro: {error_text(status, data)}")
+        return 1
+    obj = parse_json(data) or {}
+    text = obj.get("text", "")
+    if a.save:
+        with open(a.save, "w") as fh:
+            fh.write(text)
+        print(f"Conteúdo guardado em {a.save}")
+    print(f"\nConteúdo ({len(text)} caracteres):")
+    if a.full or len(text) <= a.max_chars:
+        print(text)
+    else:
+        print(text[:a.max_chars])
+        print(f"... (mais {len(text) - a.max_chars} caracteres; use --full para ver tudo)")
+    print(f"\nServidor: {format_server_metrics(parse_server_metrics(data))}")
+    return 0
+
+
+def cmd_post(a):
+    # Nomes dos ficheiros a criar
+    if a.count == 1:
+        names = [a.file_name or f"{a.prefix}0001.txt"]
+    else:
+        width = max(4, len(str(a.count)))
+        names = [f"{a.prefix}{i:0{width}d}.txt" for i in range(1, a.count + 1)]
+
+    local = threading.local()   # uma ligação por thread
+    conns, lock = [], threading.Lock()
+
+    def get_conn():
+        if not hasattr(local, "conn"):
+            local.conn = PdferConnection(a.host, a.port, a.timeout)
+            with lock:
+                conns.append(local.conn)
+        return local.conn
+
+    def one(name):
+        try:
+            status, data, ms = do_post(get_conn(), a.key, a.length, name)
+            return name, status, data, ms, None
+        except Exception as exc:
+            return name, None, None, None, f"{type(exc).__name__}: {exc}"
+
+    print(f"POST /files  key={a.key}  length={a.length}  ficheiros={len(names)}"
+          + (f"  threads={a.threads}" if len(names) > 1 else ""))
+    t0 = time.perf_counter()
+    results = []
+    with ThreadPoolExecutor(max_workers=a.threads) as pool:
+        for name, status, data, ms, err in pool.map(one, names):
+            results.append((name, status, ms, err))
+            if a.json:
+                print(f"{name}: {data.decode(errors='replace') if data else err}")
+            elif err:
+                print(f"  ERRO {name:<28} {err}")
+            elif status >= 400:
+                print(f"  ERRO {name:<28} {error_text(status, data)}")
+            else:
+                srv = format_server_metrics(parse_server_metrics(data))
+                print(f"  OK   {name:<28} {ms:8.2f} ms   servidor: {srv}")
+    wall = time.perf_counter() - t0
+    for c in conns:
+        c.close()
+
+    ok = [r for r in results if r[3] is None and r[1] is not None and r[1] < 400]
+    if len(names) > 1 and not a.json:
+        print(f"\n{len(ok)} de {len(names)} ficheiro(s) criados em {wall:.2f} s "
+              f"({len(ok) / wall:.1f} ficheiros/s)")
+        if ok:
+            lat = [r[2] for r in ok]
+            print(f"Tempo por pedido: média {statistics.mean(lat):.2f} ms, máx {max(lat):.2f} ms")
+    return 0 if len(ok) == len(names) else 1
+
+
+# ==========================================================================
 # Métricas no formato do Prometheus (implementação mínima, sem bibliotecas)
-# --------------------------------------------------------------------------
+# ==========================================================================
 # Limites dos "baldes" dos histogramas, em segundos (de 0,5 ms a 60 s)
 BUCKETS = [0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
            0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]
@@ -173,90 +400,17 @@ def start_metrics_server(metrics, port):
     return srv
 
 
-# --------------------------------------------------------------------------
-# Comunicação com o servidor
-# --------------------------------------------------------------------------
-class PdferConnection:
-    """Uma ligação HTTP persistente (keep-alive) por thread."""
-
-    def __init__(self, host, port, timeout):
-        self.host, self.port, self.timeout = host, port, timeout
-        self.conn = None
-
-    def _connect(self):
-        self.conn = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
-        self.conn.connect()
-        # Desliga o algoritmo de Nagle: evita atrasos artificiais (~40 ms)
-        # em pedidos pequenos, que falseariam os tempos medidos.
-        self.conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
-    def request(self, method, path, payload):
-        body = json.dumps(payload).encode() if payload is not None else None
-        headers = {"Content-Type": "application/json"} if body else {}
-        for attempt in (1, 2):  # 2.ª tentativa só se a ligação keep-alive tiver caído
-            if self.conn is None:
-                self._connect()
-            try:
-                t0 = time.perf_counter()
-                self.conn.request(method, path, body=body, headers=headers)
-                resp = self.conn.getresponse()
-                data = resp.read()
-                elapsed_ms = (time.perf_counter() - t0) * 1000.0
-                return resp.status, data, elapsed_ms
-            except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError):
-                self.close()
-                if attempt == 2:
-                    raise
-
-    def close(self):
-        if self.conn is not None:
-            try:
-                self.conn.close()
-            finally:
-                self.conn = None
-
-
-def do_post(conn, key, length, file_name):
-    return conn.request("POST", "/files",
-                        {"key": key, "length": length, "fileName": file_name})
-
-
-def do_get(conn, key, file_name):
-    return conn.request("GET", f"/files/{file_name}", {"key": key})
-
-
-def do_list(conn):
-    return conn.request("GET", "/files", None)
-
-
-def files_listed(data):
-    """N.º de ficheiros devolvidos por GET /files (0 se a pasta estiver vazia)."""
-    try:
-        return len(json.loads(data).get("files") or [])
-    except (ValueError, AttributeError, TypeError):
-        return ""
-
-
-def parse_server_metrics(data):
-    try:
-        m = json.loads(data).get("metrics", {}) or {}
-    except (ValueError, AttributeError):
-        return {}
-    return {f: m.get(f) for f in SERVER_FIELDS}
-
-
-# --------------------------------------------------------------------------
-# Execução da carga
-# --------------------------------------------------------------------------
-class LoadRun:
+# ==========================================================================
+# Parte 2 - testes de pressão (mostram métricas)
+# ==========================================================================
+class StressRun:
     def __init__(self, args):
         self.a = args
         self.run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
         self.rows = []
         self.lock = threading.Lock()
         self.seq = 0
-        self.created = list(args.file or [])   # ficheiros disponíveis para GET
-        self.fixed_pool = bool(args.file) or args.existing  # só se leem esses
+        self.pool = []            # ficheiros disponíveis para os GET
         self.stop_at = None
         self.rng = random.Random(args.seed)
         self.prom = None
@@ -266,7 +420,36 @@ class LoadRun:
             self.prom.set("pdfer_client_running", {}, 0)
             self.prom.set("pdfer_client_run_info",
                           {"run_id": self.run_id, "mode": args.mode, "length": args.length,
-                           "concurrency": args.concurrency}, 1)
+                           "concurrency": args.threads}, 1)
+
+    # ---- ficheiros a ler nos GET (nunca são criados aqui) ----
+    def load_pool(self):
+        if self.a.mode not in ("get", "mixed"):
+            return
+        if self.a.file:
+            self.pool = list(self.a.file)
+            print(f"GET a {len(self.pool)} ficheiro(s) indicado(s) com --file.", flush=True)
+            return
+        conn = PdferConnection(self.a.host, self.a.port, self.a.timeout)
+        try:
+            status, data, _ = do_list(conn)
+        finally:
+            conn.close()
+        if status != 200:
+            sys.exit(f"Erro a listar os ficheiros do servidor: {error_text(status, data)}")
+        names = files_from_listing(data) or []
+        if self.a.prefix:
+            names = [n for n in names if n.startswith(self.a.prefix)]
+        self.pool = names
+        where = f" com o prefixo '{self.a.prefix}'" if self.a.prefix else ""
+        if not names:
+            if self.a.mode == "get" or self.a.post_ratio == 0:
+                sys.exit(f"O servidor não tem ficheiros{where} para ler. Crie-os primeiro, "
+                         f"por exemplo: python3 pdfer_client.py post --count 20 --length 1000")
+            print(f"O servidor ainda não tem ficheiros{where}; os GET vão ler os que os "
+                  f"POST deste teste criarem.", flush=True)
+        else:
+            print(f"GET a {len(names)} ficheiro(s) que já existem no servidor{where}.", flush=True)
 
     # ---- controlo partilhado entre threads ----
     def next_seq(self):
@@ -279,38 +462,39 @@ class LoadRun:
             return self.seq
 
     def pick_method(self):
-        if self.a.mode == "post":
-            return "POST"
-        if self.a.mode == "get":
-            return "GET"
-        if self.a.mode == "list":
-            return "LIST"
+        if self.a.mode != "mixed":
+            return self.a.mode.upper()
         with self.lock:
             r = self.rng.random()
+            have_files = bool(self.pool)
         if r < self.a.post_ratio:
             return "POST"
         if r < self.a.post_ratio + self.a.list_ratio:
             return "LIST"
-        return "GET"
+        # num teste misto sem ficheiros ainda, este pedido passa a ser um dos POST do teste
+        return "GET" if have_files else "POST"
 
     def pick_existing(self):
         with self.lock:
-            return self.rng.choice(self.created) if self.created else None
+            return self.rng.choice(self.pool)
 
     def new_name(self, seq):
-        return f"{self.a.prefix}-{self.run_id}-{seq:06d}.txt"
+        return f"{self.a.post_prefix}{self.run_id}-{seq:06d}.txt"
 
     # ---- registo ----
     def record(self, seq, worker, method, file_name, start, status, data, ms, error):
         ok = error is None and 200 <= (status or 0) < 300
         srv = parse_server_metrics(data) if data else {}
+        listed = ""
+        if method == "LIST" and ok:
+            names = files_from_listing(data)
+            listed = len(names) if names is not None else ""
         row = {
             "run_id": self.run_id, "seq": seq, "worker": worker,
             "phase": "warmup" if seq <= self.a.warmup else "measure",
-            # nas listagens não há tamanho; nos GET com --file o tamanho real não é conhecido
             "method": method,
-            "length": "" if method == "LIST" or (method == "GET" and self.fixed_pool) else self.a.length,
-            "file_name": file_name, "files_listed": files_listed(data) if method == "LIST" else "",
+            "length": self.a.length if method == "POST" else "",
+            "file_name": file_name, "files_listed": listed,
             "start_epoch": f"{start:.6f}", "client_ms": f"{ms:.3f}" if ms is not None else "",
             "http_status": status if status is not None else "", "ok": int(ok),
             "error": error or "", "response_bytes": len(data) if data else 0,
@@ -320,8 +504,9 @@ class LoadRun:
             row[f"srv_{f}_us"] = "" if v is None else v
         with self.lock:
             self.rows.append(row)
-            if ok and method == "POST" and not self.fixed_pool:
-                self.created.append(file_name)
+            # no modo mixed, os ficheiros criados pelos POST do teste podem ser lidos
+            if ok and method == "POST" and self.a.mode == "mixed" and not self.a.file:
+                self.pool.append(file_name)
         if self.prom is not None:
             self.prom.inc("pdfer_client_requests_total",
                           {"method": method, "result": "ok" if ok else "error"})
@@ -333,8 +518,10 @@ class LoadRun:
                     if isinstance(v, (int, float)) and v > 0:
                         self.prom.observe("pdfer_server_phase_duration_seconds",
                                           {"method": method, "phase": f}, v / 1e6)
-                if method == "LIST" and row["files_listed"] != "":
-                    self.prom.set("pdfer_client_files_listed", {}, row["files_listed"])
+                if method == "LIST" and listed != "":
+                    self.prom.set("pdfer_client_files_listed", {}, listed)
+        if error and self.a.show_errors:
+            print(f"  erro no pedido {seq} ({method} {file_name}): {error}", flush=True)
 
     # ---- threads ----
     def worker(self, wid):
@@ -345,14 +532,8 @@ class LoadRun:
                 if seq is None:
                     break
                 method = self.pick_method()
-                if method == "GET":
-                    name = self.pick_existing()
-                    if name is None:          # ainda não há ficheiros: faz POST
-                        method, name = "POST", self.new_name(seq)
-                elif method == "LIST":
-                    name = ""
-                else:
-                    name = self.new_name(seq)
+                name = (self.pick_existing() if method == "GET"
+                        else self.new_name(seq) if method == "POST" else "")
                 start = time.time()
                 status = data = ms = error = None
                 try:
@@ -363,7 +544,7 @@ class LoadRun:
                     else:
                         status, data, ms = do_get(conn, self.a.key, name)
                     if status >= 400:
-                        error = f"HTTP {status}: {data[:120].decode(errors='replace').strip()}"
+                        error = error_text(status, data)
                 except Exception as exc:  # timeout, ligação recusada, etc.
                     error = f"{type(exc).__name__}: {exc}"
                     conn.close()
@@ -371,48 +552,11 @@ class LoadRun:
         finally:
             conn.close()
 
-    def load_existing(self):
-        """--existing: usa os ficheiros que já estão no servidor (GET /files)."""
-        conn = PdferConnection(self.a.host, self.a.port, self.a.timeout)
-        try:
-            status, data, _ = do_list(conn)
-        finally:
-            conn.close()
-        if status != 200:
-            sys.exit(f"Erro a listar os ficheiros: HTTP {status} {data[:200]!r}")
-        names = json.loads(data).get("files") or []
-        if self.a.existing_prefix:
-            names = [n for n in names if n.startswith(self.a.existing_prefix)]
-        if not names:
-            sys.exit("O servidor não tem ficheiros para ler"
-                     + (f" com o prefixo '{self.a.existing_prefix}'" if self.a.existing_prefix else "")
-                     + ". Crie alguns primeiro (modo post) ou use --file.")
-        self.created.extend(names)
-        print(f"A ler {len(names)} ficheiro(s) que já existem no servidor.", flush=True)
-
-    def prepare(self):
-        """Cria ficheiros antes da medição (necessário para os GET)."""
-        if self.a.existing:
-            self.load_existing()
-        n = self.a.prepare
-        if n <= 0:
-            return
-        print(f"A preparar {n} ficheiro(s) de {self.a.length} caracteres...", flush=True)
-        conn = PdferConnection(self.a.host, self.a.port, self.a.timeout)
-        try:
-            for i in range(1, n + 1):
-                name = f"{self.a.prefix}-{self.run_id}-prep{i:05d}.txt"
-                status, data, _ = do_post(conn, self.a.key, self.a.length, name)
-                if status >= 300:
-                    sys.exit(f"Erro a preparar ficheiros: HTTP {status} {data[:200]!r}")
-                self.created.append(name)
-        finally:
-            conn.close()
-
     def run(self):
-        self.prepare()
-        print(f"Run {self.run_id}: modo={self.a.mode} length={self.a.length} "
-              f"concorrência={self.a.concurrency} warmup={self.a.warmup} "
+        self.load_pool()
+        print(f"Teste {self.run_id}: modo={self.a.mode}"
+              + (f" length={self.a.length}" if self.a.mode in ("post", "mixed") else "")
+              + f" threads={self.a.threads} warmup={self.a.warmup} "
               + (f"duração={self.a.duration}s" if self.a.duration else f"pedidos={self.a.requests}"),
               flush=True)
         if self.a.duration:
@@ -420,21 +564,20 @@ class LoadRun:
         if self.prom is not None:
             self.prom.set("pdfer_client_running", {}, 1)
             print(f"Métricas Prometheus em http://0.0.0.0:{self.a.metrics_port}/metrics", flush=True)
-        t0 = time.time()
         threads = [threading.Thread(target=self.worker, args=(w,), daemon=True)
-                   for w in range(self.a.concurrency)]
+                   for w in range(self.a.threads)]
         for t in threads:
             t.start()
         for t in threads:
             while t.is_alive():      # join com timeout para o Ctrl+C funcionar
                 t.join(0.5)
-        self.wall = time.time() - t0
         if self.prom is not None:
             self.prom.set("pdfer_client_running", {}, 0)
 
     # ---- saída ----
     def write_csv(self):
-        path = self.a.output or f"resultados-{self.a.mode}-{self.a.length}-c{self.a.concurrency}-{self.run_id}.csv"
+        size = f"-{self.a.length}" if self.a.mode in ("post", "mixed") else ""
+        path = self.a.output or f"resultados-{self.a.mode}{size}-t{self.a.threads}-{self.run_id}.csv"
         new_file = not os.path.exists(path)
         with open(path, "a", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=CSV_COLUMNS)
@@ -450,7 +593,6 @@ class LoadRun:
             print("Sem pedidos medidos.")
             return
         # Janela de medição: do início do primeiro pedido ao fim do último
-        # (início + duração). Assim o débito também é correto com 1 só pedido.
         starts = [float(r["start_epoch"]) for r in meas]
         ends = [float(r["start_epoch"]) + float(r["client_ms"]) / 1000.0
                 for r in meas if r["client_ms"] not in ("", None)]
@@ -493,63 +635,8 @@ def pct(sorted_vals, p):
     return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (k - lo)
 
 
-# --------------------------------------------------------------------------
-def main():
-    p = argparse.ArgumentParser(description="Cliente de carga para o PDFer")
-    p.add_argument("--host", default="192.168.57.11", help="endereço do servidor (default: %(default)s)")
-    p.add_argument("--port", type=int, default=8080)
-    p.add_argument("--mode", choices=["post", "get", "list", "mixed"], default="post",
-                   help="post = criar ficheiros; get = ler ficheiros; list = listar a pasta; "
-                        "mixed = mistura (default: %(default)s)")
-    p.add_argument("--length", type=int, default=1000, help="caracteres por ficheiro (default: %(default)s)")
-    p.add_argument("--requests", type=int, default=100,
-                   help="n.º de pedidos medidos, sem contar o aquecimento (default: %(default)s)")
-    p.add_argument("--duration", type=float, default=None,
-                   help="em vez de --requests, correr durante N segundos")
-    p.add_argument("--concurrency", type=int, default=1, help="pedidos em simultâneo (default: %(default)s)")
-    p.add_argument("--warmup", type=int, default=5,
-                   help="pedidos iniciais excluídos do resumo (default: %(default)s)")
-    p.add_argument("--prepare", type=int, default=None,
-                   help="ficheiros a criar antes de medir (default: 20 em get/mixed, 0 em post/list)")
-    p.add_argument("--post-ratio", type=float, default=0.5,
-                   help="fração de POST no modo mixed (default: %(default)s)")
-    p.add_argument("--list-ratio", type=float, default=0.0,
-                   help="fração de listagens (GET /files) no modo mixed; o resto são GET de "
-                        "ficheiros (default: %(default)s)")
-    p.add_argument("--file", action="append", metavar="NOME",
-                   help="nos GET, ler este ficheiro já existente (o id/nome usado no POST); "
-                        "repetir a opção para vários ficheiros; dispensa o --prepare")
-    p.add_argument("--existing", action="store_true",
-                   help="nos GET, ler os ficheiros que já existem no servidor (pede a lista com "
-                        "GET /files) em vez de criar ficheiros novos")
-    p.add_argument("--existing-prefix", metavar="PREFIXO",
-                   help="com --existing, usar só os ficheiros cujo nome começa por PREFIXO")
-    p.add_argument("--key", default="chave-de-teste16", help="chave de 16, 24 ou 32 caracteres")
-    p.add_argument("--prefix", default="cli", help="prefixo dos nomes de ficheiro")
-    p.add_argument("--timeout", type=float, default=120.0, help="timeout por pedido em segundos")
-    p.add_argument("--seed", type=int, default=42, help="semente aleatória (reprodutibilidade)")
-    p.add_argument("--output", help="ficheiro CSV (default: nome automático; se existir, acrescenta linhas)")
-    p.add_argument("--metrics-port", type=int, default=None,
-                   help="publica métricas para o Prometheus nesta porta (ex.: 9200)")
-    p.add_argument("--metrics-linger", type=float, default=20.0,
-                   help="segundos que a página /metrics fica ativa no fim, para o "
-                        "Prometheus recolher os últimos valores (default: %(default)s)")
-    a = p.parse_args()
-
-    if len(a.key.encode()) not in (16, 24, 32):
-        p.error(f"a chave tem {len(a.key.encode())} bytes; o AES exige 16, 24 ou 32")
-    if a.concurrency < 1 or a.requests < 1 or a.length < 1:
-        p.error("--concurrency, --requests e --length têm de ser >= 1")
-    if not (0.0 <= a.post_ratio <= 1.0 and 0.0 <= a.list_ratio <= 1.0) or a.post_ratio + a.list_ratio > 1.0:
-        p.error("--post-ratio e --list-ratio têm de estar entre 0 e 1 e somar no máximo 1")
-    if (a.file or a.existing) and a.mode not in ("get", "mixed"):
-        p.error("--file e --existing só se aplicam aos modos get e mixed")
-    if a.existing_prefix and not a.existing:
-        p.error("--existing-prefix só se usa com --existing")
-    if a.prepare is None:
-        a.prepare = 0 if (a.mode in ("post", "list") or a.file or a.existing) else 20
-
-    run = LoadRun(a)
+def cmd_stress(a):
+    run = StressRun(a)
     try:
         run.run()
     except KeyboardInterrupt:
@@ -564,6 +651,125 @@ def main():
             time.sleep(a.metrics_linger)
         except KeyboardInterrupt:
             pass
+    return 0
+
+
+# ==========================================================================
+# Linha de comandos
+# ==========================================================================
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--host", default=DEFAULT_HOST, help="endereço do servidor (default: %(default)s)")
+    common.add_argument("--port", type=int, default=DEFAULT_PORT, help="porta (default: %(default)s)")
+    common.add_argument("--timeout", type=float, default=120.0, help="timeout por pedido, em segundos")
+
+    keyed = argparse.ArgumentParser(add_help=False)
+    keyed.add_argument("--key", "-k", default=DEFAULT_KEY,
+                       help="chave de exatamente 16 bytes (default: %(default)s)")
+
+    raw = argparse.ArgumentParser(add_help=False)
+    raw.add_argument("--json", action="store_true",
+                     help="mostrar a resposta exatamente como vem do servidor")
+
+    p = argparse.ArgumentParser(
+        description="Cliente para o servidor PDFer: pedidos normais (list, get, post) "
+                    "e testes de pressão (stress).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Ajuda de cada comando: python3 pdfer_client.py <comando> --help")
+    sub = p.add_subparsers(dest="command", required=True, metavar="comando")
+
+    # --- list
+    sp = sub.add_parser("list", parents=[common, raw],
+                        help="GET /files - lista os ficheiros guardados")
+    sp.set_defaults(func=cmd_list)
+
+    # --- get
+    sp = sub.add_parser("get", parents=[common, keyed, raw],
+                        help="GET /files/{fileId} - mostra o conteúdo decifrado de um ficheiro")
+    sp.add_argument("file_id", metavar="fileId", help="nome (id) do ficheiro, ex.: teste1.txt")
+    sp.add_argument("--full", action="store_true", help="mostrar o conteúdo todo")
+    sp.add_argument("--max-chars", type=int, default=500,
+                    help="caracteres mostrados sem --full (default: %(default)s)")
+    sp.add_argument("--save", metavar="FICHEIRO", help="guardar o conteúdo decifrado num ficheiro local")
+    sp.set_defaults(func=cmd_get)
+
+    # --- post
+    sp = sub.add_parser("post", parents=[common, keyed, raw],
+                        help="POST /files - cria um ou vários ficheiros (key, length, fileName)")
+    sp.add_argument("file_name", metavar="fileName", nargs="?",
+                    help="nome do ficheiro a criar (só quando se cria um ficheiro)")
+    sp.add_argument("--length", "-l", type=int, required=True,
+                    help="número de caracteres do ficheiro")
+    sp.add_argument("--count", "-c", type=int, default=1,
+                    help="número de ficheiros a criar (default: %(default)s)")
+    sp.add_argument("--threads", "-t", type=int, default=1,
+                    help="pedidos em simultâneo quando --count > 1 (default: %(default)s)")
+    sp.add_argument("--prefix", default="ficheiro-",
+                    help="prefixo dos nomes com --count, ex.: lote- dá lote-0001.txt (default: %(default)s)")
+    sp.set_defaults(func=cmd_post)
+
+    # --- stress
+    sp = sub.add_parser("stress", parents=[common, keyed],
+                        help="teste de pressão: muitos pedidos com threads; mostra métricas")
+    sp.add_argument("--mode", "-m", choices=["post", "get", "list", "mixed"], required=True,
+                    help="tipo de pedidos")
+    sp.add_argument("--threads", "-t", "--concurrency", type=int, default=1,
+                    help="pedidos em simultâneo (default: %(default)s)")
+    sp.add_argument("--requests", "-n", type=int, default=100,
+                    help="n.º de pedidos medidos, sem contar o aquecimento (default: %(default)s)")
+    sp.add_argument("--duration", "-d", type=float, default=None,
+                    help="em vez de --requests, correr durante N segundos")
+    sp.add_argument("--warmup", type=int, default=5,
+                    help="pedidos iniciais excluídos do resumo (default: %(default)s)")
+    sp.add_argument("--length", "-l", type=int, default=1000,
+                    help="caracteres de cada ficheiro criado nos POST (default: %(default)s)")
+    sp.add_argument("--file", action="append", metavar="FILEID",
+                    help="nos GET, ler este ficheiro (repetir para vários)")
+    sp.add_argument("--prefix", metavar="PREFIXO",
+                    help="nos GET, ler só os ficheiros existentes cujo nome começa por PREFIXO")
+    sp.add_argument("--post-prefix", default="stress-",
+                    help="prefixo dos ficheiros criados pelos POST do teste (default: %(default)s)")
+    sp.add_argument("--post-ratio", type=float, default=0.5,
+                    help="fração de POST no modo mixed (default: %(default)s)")
+    sp.add_argument("--list-ratio", type=float, default=0.0,
+                    help="fração de listagens no modo mixed; o resto são GET (default: %(default)s)")
+    sp.add_argument("--seed", type=int, default=42, help="semente aleatória (reprodutibilidade)")
+    sp.add_argument("--output", "-o", help="ficheiro CSV (default: nome automático; se existir, acrescenta)")
+    sp.add_argument("--show-errors", action="store_true", help="mostrar cada erro à medida que acontece")
+    sp.add_argument("--metrics-port", type=int, default=None,
+                    help="publicar métricas para o Prometheus nesta porta (ex.: 9200)")
+    sp.add_argument("--metrics-linger", type=float, default=20.0,
+                    help="segundos que /metrics fica ativo no fim (default: %(default)s)")
+    sp.set_defaults(func=cmd_stress)
+    return p
+
+
+def main():
+    p = build_parser()
+    a = p.parse_args()
+
+    if hasattr(a, "key"):
+        check_key(p, a.key)
+
+    if a.command == "post":
+        if a.length < 1 or a.count < 1 or a.threads < 1:
+            p.error("--length, --count e --threads têm de ser >= 1")
+        if a.file_name and a.count > 1:
+            p.error("com --count > 1 os nomes são gerados a partir do --prefix; não indique o fileName")
+    if a.command == "get" and a.max_chars < 0:
+        p.error("--max-chars tem de ser >= 0")
+    if a.command == "stress":
+        if a.threads < 1 or a.requests < 1 or a.length < 1 or a.warmup < 0:
+            p.error("--threads, --requests e --length têm de ser >= 1 e --warmup >= 0")
+        if not (0.0 <= a.post_ratio <= 1.0 and 0.0 <= a.list_ratio <= 1.0) \
+                or a.post_ratio + a.list_ratio > 1.0:
+            p.error("--post-ratio e --list-ratio têm de estar entre 0 e 1 e somar no máximo 1")
+        if (a.file or a.prefix) and a.mode not in ("get", "mixed"):
+            p.error("--file e --prefix só se aplicam aos modos get e mixed")
+        if a.file and a.prefix:
+            p.error("use --file ou --prefix, não os dois")
+
+    sys.exit(a.func(a))
 
 
 if __name__ == "__main__":
